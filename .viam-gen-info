@@ -1,0 +1,13 @@
+{
+  "module_name": "object-geometry",
+  "visibility": "public_unlisted",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "vision",
+  "model_name": "shape-fit",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-07-17T15:31:16.445826Z",
+  "module_readme_link": "README.md"
+}

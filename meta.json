@@ -1,0 +1,21 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam:object-geometry",
+  "visibility": "public",
+  "url": "github.com/viam-labs/object-geometry",
+  "description": "Modular vision service: shape-fit",
+  "applications": null,
+  "markdown_link": "viam_object-geometry_shape-fit.md",
+  "entrypoint": "bin/object-geometry",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}
