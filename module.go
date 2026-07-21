@@ -29,13 +29,25 @@ var (
 	errNoCamera      = errors.New(`DoCommand needs a "camera" set in the module config`)
 )
 
-// Defaults mirror the pan-detect client's constants.
 const (
-	defaultZMinMM      = 95  // above the portable stove's top surface
-	defaultZMaxMM      = 135 // just above the rim's top edge
-	defaultMinRadiusMM = 70  // plausible pan radius range
-	defaultMaxRadiusMM = 200 //
-	defaultMaxFitRMSMM = 15  // above this the fit doesn't look like a pan
+	defaultZMinMM = 95  // fallback band when a cloud is empty
+	defaultZMaxMM = 135 // just above the rim's top edge
+
+	defaultMinRadiusMM = 70  // default expected vessel radius range;
+	defaultMaxRadiusMM = 200 // override per application via config
+	maxFitRMSMM        = 15  // above this rms the points don't lie on a circle
+
+	// minContentsHeightMM: a cell must rise at least this far above the floor to
+	// count as contents. Below it, the cell is sensor noise. With a baseline the
+	// empty floor reads within ~1mm, so this cleanly separates noise from real
+	// contents and keeps an empty vessel reading empty.
+	minContentsHeightMM = 5
+
+	// zBandWidthMM: when the rim band is derived (not pinned in config),
+	// select rim points from this far below the object's top. Keep it under the
+	// rim-to-floor depth the sensor captures, or the fit picks up floor points.
+	zBandWidthMM  = 40
+	zBandMarginMM = 5 // a little headroom above the detected top
 
 	minBandPoints = 50 // too few points in the Z band to fit anything
 )
@@ -59,17 +71,17 @@ type Config struct {
 	Segmenter string   `json:"segmenter"`
 	Shapes    []string `json:"shapes,omitempty"`
 
-	// Z band the rim is expected to fall in, world frame. Defaults match the
-	// pan-detect client: above the stove's top surface, just past the rim's
-	// top edge. Both must be set together to override.
+	// Z band the rim is expected to fall in, world frame. Setting both PINS the
+	// band to these absolute values. Leaving them unset (the default) derives
+	// the band per detection from the object's own top, so it adapts to the
+	// vessel's height instead of a fixed scene height. Both must be set together.
 	ZMinMM *float64 `json:"z_min_mm,omitempty"`
 	ZMaxMM *float64 `json:"z_max_mm,omitempty"`
 
-	// Fit acceptance bounds. A fit outside these is still returned, flagged
-	// "suspect" — the client warns and carries on rather than dropping it.
+	// Expected vessel radius range; fits outside it are rejected. Size these
+	// to the application — a pan and a large bin need different bounds.
 	MinRadiusMM float64 `json:"min_radius_mm,omitempty"`
 	MaxRadiusMM float64 `json:"max_radius_mm,omitempty"`
-	MaxFitRMSMM float64 `json:"max_fit_rms_mm,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
@@ -101,15 +113,15 @@ type objectGeometryShapeFit struct {
 
 	zMinMM      float64
 	zMaxMM      float64
+	fixedBand   bool // true when z_min_mm/z_max_mm pin the band
 	minRadiusMM float64
 	maxRadiusMM float64
-	maxFitRMSMM float64
 
 	segmenter vision.Service
 	fsService framesystem.Service
 
 	mu        sync.Mutex
-	baselines []vesselBaseline // empty vessels captured at recipe start
+	baselines []vesselBaseline // vessels captured while empty, via capture_baseline
 }
 
 func newObjectGeometryShapeFit(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (vision.Service, error) {
@@ -141,12 +153,12 @@ func NewShapeFit(ctx context.Context, deps resource.Dependencies, name resource.
 		zMaxMM:      defaultZMaxMM,
 		minRadiusMM: orDefault(conf.MinRadiusMM, defaultMinRadiusMM),
 		maxRadiusMM: orDefault(conf.MaxRadiusMM, defaultMaxRadiusMM),
-		maxFitRMSMM: orDefault(conf.MaxFitRMSMM, defaultMaxFitRMSMM),
 		segmenter:   seg,
 		fsService:   fsSvc,
 	}
 	if conf.ZMinMM != nil {
 		s.zMinMM, s.zMaxMM = *conf.ZMinMM, *conf.ZMaxMM
+		s.fixedBand = true
 	}
 	return s, nil
 }
@@ -297,9 +309,6 @@ type shapeResult struct {
 	RMS      float64
 	PointCnt int
 	Cloud    pointcloud.PointCloud
-	// Warning is set when the fit is outside the expected bounds. The result
-	// is still returned, matching the client's warn-and-continue behavior.
-	Warning string
 }
 
 func (s *objectGeometryShapeFit) detect(ctx context.Context, cameraName string) ([]shapeResult, error) {
@@ -310,11 +319,12 @@ func (s *objectGeometryShapeFit) detect(ctx context.Context, cameraName string) 
 
 	var results []shapeResult
 	for i, pcWorld := range clouds {
-		// Keep only points in the rim height band
+		// Keep only points in the rim height band (pinned or derived per object).
+		zMin, zMax := s.rimBand(pcWorld)
 		var pts []r3.Vector
 		var zSum float64
 		pcWorld.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
-			if p.Z >= s.zMinMM && p.Z <= s.zMaxMM {
+			if p.Z >= zMin && p.Z <= zMax {
 				pts = append(pts, p)
 				zSum += p.Z
 			}
@@ -323,7 +333,7 @@ func (s *objectGeometryShapeFit) detect(ctx context.Context, cameraName string) 
 
 		if len(pts) < minBandPoints {
 			s.logger.Warnf("object %d: only %d points in z band [%.0f, %.0f]mm, skipping",
-				i, len(pts), s.zMinMM, s.zMaxMM)
+				i, len(pts), zMin, zMax)
 			continue
 		}
 
@@ -333,14 +343,28 @@ func (s *objectGeometryShapeFit) detect(ctx context.Context, cameraName string) 
 				centerX, centerY, r, rms := fitCircleKasa(pts)
 				rimZ := zSum / float64(len(pts))
 
-				// Out-of-range fits are still returned, flagged suspect: the
-				// client warns and keeps going rather than dropping them.
-				var warning string
-				if r < s.minRadiusMM || r > s.maxRadiusMM || rms > s.maxFitRMSMM {
-					warning = fmt.Sprintf(
-						"fit doesn't look like a pan (radius %.1fmm, expected %.0f-%.0fmm; rms %.1fmm, expected under %.0fmm)",
-						r, s.minRadiusMM, s.maxRadiusMM, rms, s.maxFitRMSMM)
-					s.logger.Warnf("object %d: %s", i, warning)
+				// Points that don't lie on a circle are routine segmenter
+				// junk (slivers, noise): drop quietly.
+				if rms > maxFitRMSMM {
+					s.logger.Debugf("object %d: not a circle (rms %.1fmm, expected under %.0fmm), skipping",
+						i, rms, maxFitRMSMM)
+					continue
+				}
+				// Smaller than the rim inset means no usable interior at
+				// all — degenerate junk (a marker dot, a tool tip), not a
+				// candidate vessel. Quiet, or it spams every detect.
+				if r < 2*insetMM {
+					s.logger.Debugf("object %d: degenerate fit (radius %.1fmm), skipping", i, r)
+					continue
+				}
+				// A clean circle outside the configured size range is a
+				// plausible real object being dropped — warn so a
+				// mis-sized min/max_radius_mm config is visible instead of
+				// silently detecting nothing.
+				if r < s.minRadiusMM || r > s.maxRadiusMM {
+					s.logger.Warnf("object %d: circle fit rejected by size bounds (radius %.1fmm, configured range %.0f-%.0fmm)",
+						i, r, s.minRadiusMM, s.maxRadiusMM)
+					continue
 				}
 
 				results = append(results, shapeResult{
@@ -352,13 +376,65 @@ func (s *objectGeometryShapeFit) detect(ctx context.Context, cameraName string) 
 					RMS:      rms,
 					PointCnt: len(pts),
 					Cloud:    pcWorld,
-					Warning:  warning,
 				})
 			}
 		}
 	}
 
-	return results, nil
+	return dedupeOverlapping(results), nil
+}
+
+// rimBand returns the world-Z window to select rim points from. When the band
+// is pinned in config it's returned verbatim; otherwise it's derived from the
+// object's own top — the rim is the highest part of the vessel, so anchor the
+// band to a high percentile of the object's Z (robust to a stray high point)
+// and look zBandWidthMM below it. This adapts to the vessel's height with no
+// hard-coded scene heights.
+func (s *objectGeometryShapeFit) rimBand(pcWorld pointcloud.PointCloud) (zMin, zMax float64) {
+	if s.fixedBand {
+		return s.zMinMM, s.zMaxMM
+	}
+	var zs []float64
+	pcWorld.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
+		zs = append(zs, p.Z)
+		return true
+	})
+	if len(zs) == 0 {
+		return s.zMinMM, s.zMaxMM // nothing to derive from; fall back to defaults
+	}
+	sort.Float64s(zs)
+	topZ := zs[len(zs)*95/100] // 95th percentile ≈ rim top
+	return topZ - zBandWidthMM, topZ + zBandMarginMM
+}
+
+// dedupeOverlapping collapses fits of the same physical object. The segmenter
+// can return one vessel as several overlapping clouds, each yielding its own
+// circle centered inside the others. Keep the strongest fit (most points) in
+// each overlapping cluster and drop the rest. Two distinct vessels don't
+// overlap, so this never merges separate vessels.
+func dedupeOverlapping(results []shapeResult) []shapeResult {
+	// Most points first, so the strongest fit in a cluster is kept and the
+	// weaker overlapping ones are dropped against it.
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].PointCnt > results[j].PointCnt
+	})
+
+	var kept []shapeResult
+	for _, r := range results {
+		overlapped := false
+		for _, k := range kept {
+			// Centers closer than the kept fit's radius means r's center lies
+			// inside k's circle: the same object seen twice.
+			if math.Hypot(r.CenterX-k.CenterX, r.CenterY-k.CenterY) < k.Radius {
+				overlapped = true
+				break
+			}
+		}
+		if !overlapped {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
 
 func (s *objectGeometryShapeFit) doDetect(ctx context.Context) (map[string]interface{}, error) {
@@ -385,10 +461,6 @@ func (s *objectGeometryShapeFit) doDetect(ctx context.Context) (map[string]inter
 		if r.Shape == "circle" {
 			m["radius_mm"] = math.Round(r.Radius*10) / 10
 			m["rim_height_mm"] = math.Round(r.CenterZ*10) / 10
-		}
-		if r.Warning != "" {
-			m["suspect"] = true
-			m["warning"] = r.Warning
 		}
 		fitted = append(fitted, m)
 	}
@@ -434,7 +506,7 @@ func (s *objectGeometryShapeFit) doAnalyzeRegion(ctx context.Context, params int
 	}
 
 	baseline := s.pickBaseline(centerX, centerY)
-	result := analyzeRegion(pcWorld, centerX, centerY, rimZ, radius, baseline)
+	result := analyzeRegion(pcWorld, centerX, centerY, rimZ, radius, minContentsHeightMM, baseline)
 	if baseline != nil {
 		result["floor_source"] = "baseline"
 	} else {
@@ -443,9 +515,10 @@ func (s *objectGeometryShapeFit) doAnalyzeRegion(ctx context.Context, params int
 	return result, nil
 }
 
-// doCaptureBaseline detects the empty vessels currently in view and stores them
-// as the recipe-start baseline, replacing any previous capture. It returns the
-// captured vessels: center, radius, rim and floor height, and cell count.
+// doCaptureBaseline detects the vessels currently in view — call it while they
+// are empty — and stores them as the baseline, replacing any previous capture.
+// It returns the captured vessels: center, radius, rim and floor height, and
+// cell count.
 func (s *objectGeometryShapeFit) doCaptureBaseline(ctx context.Context) (map[string]interface{}, error) {
 	if s.camera == "" {
 		return nil, errNoCamera
@@ -467,15 +540,15 @@ func (s *objectGeometryShapeFit) doCaptureBaseline(ctx context.Context) (map[str
 				r.CenterX, r.CenterY)
 			continue
 		}
-		floorGrid, floorMean := g.floorSnapshot()
+		floorGrid, floorLevel := g.floorSnapshot()
 		baselines = append(baselines, vesselBaseline{
-			centerX:   r.CenterX,
-			centerY:   r.CenterY,
-			radius:    r.Radius,
-			floorMean: floorMean,
-			floorGrid: floorGrid,
-			halfCells: g.halfCells,
-			gridCells: g.occupied,
+			centerX:    r.CenterX,
+			centerY:    r.CenterY,
+			radius:     r.Radius,
+			floorLevel: floorLevel,
+			floorGrid:  floorGrid,
+			halfCells:  g.halfCells,
+			gridCells:  g.occupied,
 		})
 		vessels = append(vessels, map[string]interface{}{
 			"center_mm": map[string]interface{}{
@@ -483,10 +556,10 @@ func (s *objectGeometryShapeFit) doCaptureBaseline(ctx context.Context) (map[str
 				"y": math.Round(r.CenterY),
 				"z": 0.0,
 			},
-			"radius_mm":       math.Round(r.Radius),
-			"rim_z_mm":        math.Round(r.CenterZ),
-			"floor_z_mm_mean": math.Round(floorMean),
-			"grid_cells":      g.occupied,
+			"radius_mm":  math.Round(r.Radius),
+			"rim_z_mm":   math.Round(r.CenterZ),
+			"floor_z_mm": math.Round(floorLevel),
+			"grid_cells": g.occupied,
 		})
 	}
 
@@ -533,6 +606,13 @@ type heightGrid struct {
 func buildHeightGrid(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius float64) heightGrid {
 	innerR := radius - insetMM
 
+	// A degenerate fit (tiny, NaN, or Inf radius) yields innerR <= 0, which
+	// would make gridWidth negative and panic makeslice. Bail with an empty
+	// grid; callers treat occupied == 0 / no cells as "nothing to analyze".
+	if !(innerR > 0) || math.IsInf(innerR, 0) {
+		return heightGrid{}
+	}
+
 	// Square grid of 3mm squares boxing in the vessel interior. Indices run
 	// 0..gridWidth-1, so halfCells doubles as the center cell: subtract it
 	// from an index to get that cell's offset from the middle.
@@ -576,38 +656,56 @@ func buildHeightGrid(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius fl
 	return heightGrid{meanZ: meanZ, cnt: cnt, halfCells: halfCells, occupied: occupied}
 }
 
+// floorCenterFrac: cells within this fraction of the radius define the flat
+// bottom. A vessel is a bowl — flat bottom in the middle, walls at the edge —
+// so the floor level comes from the center, not the whole interior (whose mean
+// or even a low percentile is pulled up by the walls).
+const floorCenterFrac = 0.5
+
 // floorSnapshot copies the grid as an empty-floor reference: each observed
-// cell's mean Z, NaN where nothing was seen, plus the mean of observed cells.
-func (g heightGrid) floorSnapshot() (grid [][]float64, mean float64) {
+// cell's mean Z (NaN where nothing was seen), plus a scalar floor level taken
+// from the central cells — the flat bottom, which the sensor undersamples
+// relative to the brighter angled walls.
+func (g heightGrid) floorSnapshot() (grid [][]float64, floor float64) {
 	w := len(g.meanZ)
 	grid = make([][]float64, w)
-	var sum float64
-	var n int
+
+	centerRadius := float64(g.halfCells) * floorCenterFrac
+	var central, all []float64
 	for r := range w {
 		grid[r] = make([]float64, w)
 		for c := range w {
-			if g.cnt[r][c] > 0 {
-				grid[r][c] = g.meanZ[r][c]
-				sum += g.meanZ[r][c]
-				n++
-			} else {
+			if g.cnt[r][c] == 0 {
 				grid[r][c] = math.NaN()
+				continue
+			}
+			grid[r][c] = g.meanZ[r][c]
+			all = append(all, g.meanZ[r][c])
+			if math.Hypot(float64(c-g.halfCells), float64(r-g.halfCells)) <= centerRadius {
+				central = append(central, g.meanZ[r][c])
 			}
 		}
 	}
-	if n > 0 {
-		mean = sum / float64(n)
+
+	// Median of the central cells is the flat-bottom height. Fall back to the
+	// overall low end if the center happened to see nothing.
+	if len(central) > 0 {
+		sort.Float64s(central)
+		floor = central[len(central)/2]
+	} else if len(all) > 0 {
+		sort.Float64s(all)
+		floor = all[len(all)/10]
 	}
-	return grid, mean
+	return grid, floor
 }
 
-// vesselBaseline is an empty vessel captured at recipe start: where it is, how
-// deep it is, and a per-cell floor map. Later analysis measures food height
+// vesselBaseline is a vessel captured while empty: where it is, how deep it
+// is, and a per-cell floor map. Later analysis measures contents height
 // against this instead of the lowest currently-visible cell.
 type vesselBaseline struct {
 	centerX, centerY float64
 	radius           float64
-	floorMean        float64
+	floorLevel       float64
 	floorGrid        [][]float64 // per-cell empty floor Z; NaN where unobserved
 	halfCells        int
 	gridCells        int
@@ -618,159 +716,82 @@ type vesselBaseline struct {
 // different cell count — it falls back to the scalar mean floor.
 func (b *vesselBaseline) floorAt(halfCells int) func(r, c int) float64 {
 	if b.halfCells != halfCells {
-		return func(r, c int) float64 { return b.floorMean }
+		return func(r, c int) float64 { return b.floorLevel }
 	}
 	return func(r, c int) float64 {
 		if f := b.floorGrid[r][c]; !math.IsNaN(f) {
 			return f
 		}
-		return b.floorMean // a cell the baseline never saw
+		return b.floorLevel // a cell the baseline never saw
 	}
 }
 
-// analyzeRegion examines the contents of a vessel. A non-nil baseline supplies
-// a per-cell empty-floor reference captured earlier; without one, heights are
-// measured from the lowest currently-visible cell (an estimated floor).
-func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius float64, baseline *vesselBaseline) map[string]interface{} {
-	g := buildHeightGrid(pc, centerX, centerY, rimZ, radius)
-	meanZ, cnt, halfCells := g.meanZ, g.cnt, g.halfCells
-	gridWidth := len(meanZ)
+// zeroSectors returns a sector-coverage slice of numSectors zeros. It's a
+// []interface{} (not [numSectors]float64) so it serializes into the protobuf
+// Struct that DoCommand returns.
+func zeroSectors() []interface{} {
+	s := make([]interface{}, numSectors)
+	for i := range s {
+		s[i] = 0.0
+	}
+	return s
+}
 
-	var allMeanZs []float64
-	for r := range gridWidth {
-		for c := range gridWidth {
-			if cnt[r][c] > 0 {
-				allMeanZs = append(allMeanZs, meanZ[r][c])
+// blob is one connected region of contents, in world millimeters. It's the shared
+// output of blob detection, consumed both by analyze_region (as a map) and by
+// the Detections overlay (projected to image pixels).
+type blob struct {
+	centerX, centerY   float64
+	areaMM2            float64
+	axisDeg            float64
+	majorLen, minorLen float64
+	meanHeight         float64
+}
+
+// regionGrid builds the height grid and derives the median and per-cell floor
+// lookup shared by the analysis. ok is false when the region has too few cells
+// to analyze.
+func regionGrid(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius float64, baseline *vesselBaseline) (g heightGrid, medZ float64, floorAt func(r, c int) float64, ok bool) {
+	g = buildHeightGrid(pc, centerX, centerY, rimZ, radius)
+
+	var all []float64
+	for r := range g.meanZ {
+		for c := range g.meanZ[r] {
+			if g.cnt[r][c] > 0 {
+				all = append(all, g.meanZ[r][c])
 			}
 		}
 	}
-
-	empty := map[string]interface{}{
-		"centroid_mm":     map[string]interface{}{"x": 0.0, "y": 0.0},
-		"mean_height_mm":  0.0,
-		"sector_coverage": [8]float64{},
-		"blobs":           []interface{}{},
-	}
-	if len(allMeanZs) < 10 {
-		return empty
+	if len(all) < 10 {
+		return g, 0, nil, false
 	}
 
 	// medZ splits the interior into "taller than typical" and "at floor
 	// level"; minZ is the fallback floor when no baseline is supplied.
-	sort.Float64s(allMeanZs)
-	minZ := allMeanZs[0]
-	medZ := allMeanZs[len(allMeanZs)/2]
-
-	// floorAt gives each cell's height reference: the captured empty floor
-	// when a baseline is supplied, otherwise minZ.
-	floorAt := func(r, c int) float64 { return minZ }
+	sort.Float64s(all)
+	minZ := all[0]
+	medZ = all[len(all)/2]
+	floorAt = func(r, c int) float64 { return minZ }
 	if baseline != nil {
-		floorAt = baseline.floorAt(halfCells)
+		floorAt = baseline.floorAt(g.halfCells)
 	}
+	return g, medZ, floorAt, true
+}
 
-	// Centroid weighted by height above the floor times point count, so it is
-	// pulled toward where the food actually is rather than the vessel center.
-	var totalPts int
-	var sumH float64
-	var wx, wy, wTotal float64
-	for r := range gridWidth {
-		for c := range gridWidth {
-			if cnt[r][c] == 0 {
-				continue
-			}
-			h := meanZ[r][c] - floorAt(r, c) // height above floor
-			n := cnt[r][c]                   // how many points landed here
+// findBlobs flood-fills connected contents cells and describes each with a centroid,
+// area, PCA axis, and extent. A cell is contents only if it's above the median and
+// rises at least minContentsHeightMM over the floor.
+func findBlobs(meanZ [][]float64, cnt [][]int, halfCells int, centerX, centerY, medZ, minContentsHeightMM float64, floorAt func(r, c int) float64) []blob {
+	gridWidth := len(meanZ)
 
-			// Running totals for mean height: point-weighted so densely
-			// sampled cells count more than sparse ones.
-			totalPts += n
-			sumH += h * float64(n)
-
-			// This cell's real-world position (grid index back to mm).
-			cellX := centerX + float64(c-halfCells)*gridCellMM
-			cellY := centerY + float64(r-halfCells)*gridCellMM
-
-			// Weight = height above floor * point count. Tall, well-sampled
-			// cells (where the food is) dominate; flat or sparse cells
-			// contribute ~nothing. wx/wy accumulate position*weight and
-			// wTotal the weights, so wx/wTotal below is the center of mass.
-			w := h * float64(n)
-			wx += cellX * w
-			wy += cellY * w
-			wTotal += w
-		}
-	}
-
-	centroid := map[string]interface{}{"x": 0.0, "y": 0.0}
-	var meanHeight float64
-	if wTotal > 0 {
-		centroid = map[string]interface{}{
-			"x": math.Round(wx / wTotal),
-			"y": math.Round(wy / wTotal),
-		}
-	}
-	if totalPts > 0 {
-		meanHeight = math.Round(sumH / float64(totalPts))
-	}
-
-	// Sector coverage: split the interior into numSectors equal wedges by
-	// angle about the center, average each wedge's cell heights, then rescale
-	// the wedge means onto 0..1 where 0 is the flattest wedge and 1 the
-	// tallest. Rescaling per call is what makes the output comparable across
-	// vessels and fill levels — it reports *where* the food is piled, not how
-	// much there is. The consequence is that a perfectly even vessel and a
-	// perfectly empty one both read as all-zeros.
-	var secSum [numSectors]float64
-	var secCnt [numSectors]int
-	for r := range gridWidth {
-		for c := range gridWidth {
-			if cnt[r][c] == 0 {
-				continue
-			}
-			dx := float64(c-halfCells) * gridCellMM
-			dy := float64(r-halfCells) * gridCellMM
-			// Atan2 returns (-pi, pi]; shift to [0, 2pi) so sector indices
-			// run counterclockwise from +X with no negative wraparound.
-			a := math.Atan2(dy, dx)
-			if a < 0 {
-				a += 2 * math.Pi
-			}
-			sec := int(a / (2 * math.Pi) * numSectors)
-			if sec >= numSectors {
-				sec = numSectors - 1
-			}
-			secSum[sec] += meanZ[r][c]
-			secCnt[sec]++
-		}
-	}
-	var secMean [numSectors]float64
-	secMin, secMax := math.Inf(1), math.Inf(-1)
-	for i := range numSectors {
-		if secCnt[i] > 0 {
-			secMean[i] = secSum[i] / float64(secCnt[i])
-			secMin = math.Min(secMin, secMean[i])
-			secMax = math.Max(secMax, secMean[i])
-		}
-	}
-	var sectorCoverage [numSectors]float64
-	if span := secMax - secMin; span > 0 {
-		for i := range numSectors {
-			if secCnt[i] > 0 {
-				sectorCoverage[i] = math.Round((secMean[i]-secMin)/span*10) / 10
-			}
-		}
-	}
-
-	// Blob detection. Occupancy is "taller than the median cell", which needs
-	// no tuned threshold: the median splits the interior into food and floor
-	// on its own. The tradeoff is that it always finds *something* — in an
-	// empty vessel, half the cells still sit above the median and become
-	// blobs made of noise. minBlobCells is what suppresses those.
+	// Occupancy: no tuned threshold — the median splits contents from floor, and
+	// the height gate drops sensor noise so an empty vessel stays empty.
 	occ := make([][]bool, gridWidth)
 	for r := range gridWidth {
 		occ[r] = make([]bool, gridWidth)
 		for c := range gridWidth {
-			occ[r][c] = cnt[r][c] > 0 && meanZ[r][c] > medZ
+			occ[r][c] = cnt[r][c] > 0 && meanZ[r][c] > medZ &&
+				meanZ[r][c]-floorAt(r, c) >= minContentsHeightMM
 		}
 	}
 
@@ -778,12 +799,12 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 	for i := range gridWidth {
 		visited[i] = make([]bool, gridWidth)
 	}
-	// 8-connectivity: diagonal neighbors count, so a food region joined only
-	// at the corners stays one blob instead of splitting in two.
+	// 8-connectivity: diagonal neighbors count, so a region joined only at the
+	// corners stays one blob.
 	type cell struct{ r, c int }
 	dirs := [8][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {-1, 1}, {1, -1}, {1, 1}}
 
-	var blobs []interface{}
+	var blobs []blob
 	for r := range gridWidth {
 		for c := range gridWidth {
 			if !occ[r][c] || visited[r][c] {
@@ -826,17 +847,8 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 			bh /= tp
 			area := float64(len(comp)) * gridCellMM * gridCellMM
 
-			// PCA on the blob's cells to find its elongation and heading.
-			// Build the 2x2 covariance of cell offsets from the blob
-			// centroid, weighted by point count:
-			//
-			//	[ cxx  cxy ]
-			//	[ cxy  cyy ]
-			//
-			// Its eigenvectors are the blob's principal axes and the larger
-			// eigenvalue's vector is the major axis — the direction the blob
-			// is longest along, which is what tells a stretched smear apart
-			// from a round mound.
+			// PCA on the blob's cells: the 2x2 covariance's larger-eigenvalue
+			// vector is the major axis (a stretched smear vs. a round mound).
 			var cxx, cxy, cyy float64
 			for _, cl := range comp {
 				ddx := centerX + float64(cl.c-halfCells)*gridCellMM - bx
@@ -849,20 +861,10 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 			cxx /= tp
 			cxy /= tp
 			cyy /= tp
-			// Closed-form eigenvalues of a symmetric 2x2: the characteristic
-			// polynomial lam^2 - tr*lam + det = 0 solves to tr/2 +/- disc.
-			// lam1 is the larger, so its eigenvector is the major axis. The
-			// Max(..., 0) guards a tiny negative discriminant from roundoff —
-			// a symmetric matrix always has real eigenvalues.
 			tr := cxx + cyy
 			det := cxx*cyy - cxy*cxy
 			disc := math.Sqrt(math.Max(tr*tr/4-det, 0))
 			lam1 := tr/2 + disc
-
-			// Eigenvector for lam1 is proportional to (cxy, lam1-cxx), giving
-			// the major-axis angle. When cxy ~= 0 the axes are already aligned
-			// with X and Y, and the eigenvector formula degenerates to 0/0 —
-			// so pick the axis with the larger variance directly.
 			var angle float64
 			if math.Abs(cxy) > 1e-9 {
 				angle = math.Atan2(lam1-cxx, cxy)
@@ -870,10 +872,7 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 				angle = math.Pi / 2
 			}
 
-			// Project every cell onto the two axes (a rotation by -angle) and
-			// track the extent along each. Lengths come from the actual
-			// spread of cells rather than from the eigenvalues, so a blob's
-			// reported size is its real footprint, not a Gaussian estimate.
+			// Extent along each axis from the actual cell spread.
 			cosA, sinA := math.Cos(angle), math.Sin(angle)
 			var minMaj, maxMaj, minMin, maxMin float64
 			for i, cl := range comp {
@@ -892,18 +891,143 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 				}
 			}
 
-			blobs = append(blobs, map[string]interface{}{
-				"centroid_mm":    map[string]interface{}{"x": math.Round(bx), "y": math.Round(by)},
-				"area_mm2":       math.Round(area),
-				"major_axis_deg": math.Round(angle * 180 / math.Pi),
-				"major_len_mm":   math.Round(maxMaj - minMaj + gridCellMM),
-				"minor_len_mm":   math.Round(maxMin - minMin + gridCellMM),
-				"mean_height_mm": math.Round(bh),
+			blobs = append(blobs, blob{
+				centerX:    bx,
+				centerY:    by,
+				areaMM2:    area,
+				axisDeg:    angle * 180 / math.Pi,
+				majorLen:   maxMaj - minMaj + gridCellMM,
+				minorLen:   maxMin - minMin + gridCellMM,
+				meanHeight: bh,
 			})
 		}
 	}
-	if blobs == nil {
-		blobs = []interface{}{}
+	return blobs
+}
+
+// analyzeRegion examines the contents of a vessel. A non-nil baseline supplies
+// a per-cell empty-floor reference captured earlier; without one, heights are
+// measured from the lowest currently-visible cell (an estimated floor).
+func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius, minContentsHeightMM float64, baseline *vesselBaseline) map[string]interface{} {
+	empty := map[string]interface{}{
+		"centroid_mm":     map[string]interface{}{"x": 0.0, "y": 0.0},
+		"mean_height_mm":  0.0,
+		"sector_coverage": zeroSectors(),
+		"blobs":           []interface{}{},
+	}
+	g, medZ, floorAt, ok := regionGrid(pc, centerX, centerY, rimZ, radius, baseline)
+	if !ok {
+		return empty
+	}
+	meanZ, cnt, halfCells := g.meanZ, g.cnt, g.halfCells
+	gridWidth := len(meanZ)
+
+	// Centroid weighted by height above the floor times point count, so it is
+	// pulled toward where the contents actually is rather than the vessel center.
+	var totalPts int
+	var sumH float64
+	var wx, wy, wTotal float64
+	for r := range gridWidth {
+		for c := range gridWidth {
+			if cnt[r][c] == 0 {
+				continue
+			}
+			h := meanZ[r][c] - floorAt(r, c) // height above floor
+			n := cnt[r][c]                   // how many points landed here
+
+			// Running totals for mean height: point-weighted so densely
+			// sampled cells count more than sparse ones.
+			totalPts += n
+			sumH += h * float64(n)
+
+			// This cell's real-world position (grid index back to mm).
+			cellX := centerX + float64(c-halfCells)*gridCellMM
+			cellY := centerY + float64(r-halfCells)*gridCellMM
+
+			// Weight = height above floor * point count. Tall, well-sampled
+			// cells (where the contents is) dominate; flat or sparse cells
+			// contribute ~nothing. wx/wy accumulate position*weight and
+			// wTotal the weights, so wx/wTotal below is the center of mass.
+			w := h * float64(n)
+			wx += cellX * w
+			wy += cellY * w
+			wTotal += w
+		}
+	}
+
+	centroid := map[string]interface{}{"x": 0.0, "y": 0.0}
+	var meanHeight float64
+	if wTotal > 0 {
+		centroid = map[string]interface{}{
+			"x": math.Round(wx / wTotal),
+			"y": math.Round(wy / wTotal),
+		}
+	}
+	if totalPts > 0 {
+		meanHeight = math.Round(sumH / float64(totalPts))
+	}
+
+	// Sector coverage: split the interior into numSectors equal wedges by
+	// angle about the center, average each wedge's cell heights, then rescale
+	// the wedge means onto 0..1 where 0 is the flattest wedge and 1 the
+	// tallest. Rescaling per call is what makes the output comparable across
+	// vessels and fill levels — it reports *where* the contents is piled, not how
+	// much there is. The consequence is that a perfectly even vessel and a
+	// perfectly empty one both read as all-zeros.
+	var secSum [numSectors]float64
+	var secCnt [numSectors]int
+	for r := range gridWidth {
+		for c := range gridWidth {
+			if cnt[r][c] == 0 {
+				continue
+			}
+			dx := float64(c-halfCells) * gridCellMM
+			dy := float64(r-halfCells) * gridCellMM
+			// Atan2 returns (-pi, pi]; shift to [0, 2pi) so sector indices
+			// run counterclockwise from +X with no negative wraparound.
+			a := math.Atan2(dy, dx)
+			if a < 0 {
+				a += 2 * math.Pi
+			}
+			sec := int(a / (2 * math.Pi) * numSectors)
+			if sec >= numSectors {
+				sec = numSectors - 1
+			}
+			secSum[sec] += meanZ[r][c]
+			secCnt[sec]++
+		}
+	}
+	var secMean [numSectors]float64
+	secMin, secMax := math.Inf(1), math.Inf(-1)
+	for i := range numSectors {
+		if secCnt[i] > 0 {
+			secMean[i] = secSum[i] / float64(secCnt[i])
+			secMin = math.Min(secMin, secMean[i])
+			secMax = math.Max(secMax, secMean[i])
+		}
+	}
+	// []interface{}, not [numSectors]float64: a fixed-size array can't be
+	// serialized into a protobuf Struct for the DoCommand response.
+	sectorCoverage := zeroSectors()
+	if span := secMax - secMin; span > 0 {
+		for i := range numSectors {
+			if secCnt[i] > 0 {
+				sectorCoverage[i] = math.Round((secMean[i]-secMin)/span*10) / 10
+			}
+		}
+	}
+
+	// Blob detection, shared with the Detections overlay.
+	blobs := []interface{}{}
+	for _, b := range findBlobs(meanZ, cnt, halfCells, centerX, centerY, medZ, minContentsHeightMM, floorAt) {
+		blobs = append(blobs, map[string]interface{}{
+			"centroid_mm":    map[string]interface{}{"x": math.Round(b.centerX), "y": math.Round(b.centerY)},
+			"area_mm2":       math.Round(b.areaMM2),
+			"major_axis_deg": math.Round(b.axisDeg),
+			"major_len_mm":   math.Round(b.majorLen),
+			"minor_len_mm":   math.Round(b.minorLen),
+			"mean_height_mm": math.Round(b.meanHeight),
+		})
 	}
 
 	return map[string]interface{}{
@@ -921,17 +1045,7 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius floa
 // fitCircleKasa fits a circle to the XY projection of pts (Z is ignored) and
 // returns the center, radius, and rms residual in the same units as the input.
 //
-// The method rests on a change of variables. A circle
-//
-//	(x-centerX)^2 + (y-centerY)^2 = r^2
-//
-// expands and regroups into
-//
-//	(x^2+y^2) + D*x + E*y + F = 0,  D = -2cx, E = -2cy, F = centerX^2+centerY^2-r^2
-//
-// which is *linear* in D, E, F even though the original is nonlinear in
-// centerX, centerY, r. So the fit is one closed-form 3x3 least-squares solve: no
-// initial guess, no iteration, no failure to converge.
+// A circle is (x-centerX)^2 + (y-centerY)^2 = r^2
 //
 // The tradeoff is bias. Least squares on this form minimizes the algebraic
 // residual, and for a point at distance d from the center that residual is
