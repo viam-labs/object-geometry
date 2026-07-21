@@ -42,13 +42,20 @@ A fit whose points don't actually lie on a circle (high fit residual) is also
 rejected internally, so slivers and partial edges the segmenter returns don't
 come back as vessels.
 
-**Rim band, pinned vs derived.** By default the band is derived from each
-object's own top (95th percentile of its Z, minus an internal 40mm band
-width), so it adapts to wherever the vessel sits with no hard-coded scene
-heights. Pinning with `z_min_mm`/`z_max_mm` is the escape hatch when the
-derived band misbehaves — e.g. a depth sensor that flattens the vessel
-interior close to rim level can drag the derived band (and the reported rim
-height) down.
+**Rim band, pinned vs derived.** By default the band is derived per detection
+from the object's distinct substantial surfaces (5mm height-bins holding
+enough points to be real structure), tried from the highest down: each
+candidate surface gets a thin band around it (~12mm below, ~10mm above — just
+enough for noise, tilt, and the lip) and a circle fit, and the first surface
+that fits like a vessel wins. The rim is the vessel's highest structure, so
+it's normally the first candidate; a taller object leaking into the crop (a
+utensil beside the vessel) fails the fit and falls through to the rim.
+Anchoring on surfaces rather than a percentile of all points keeps the band
+on the rim even when a full vessel's contents dominate the point count.
+Pinning with `z_min_mm`/`z_max_mm` remains the escape hatch on sensors where
+the derivation misbehaves. Known limit: contents heaped *above* the rim
+across the vessel are indistinguishable from the vessel top — pin the band if
+that's a real operating condition.
 
 ### Example Configuration
 
@@ -66,6 +73,14 @@ height) down.
 `GetObjectPointClouds` returns one object per fitted shape, carrying the
 source point cloud. The camera name comes from the request, so `camera` in the
 config is not consulted.
+
+`CaptureAllFromCamera` returns the camera frame with the analysis drawn on it:
+the fitted circle, the eight sector wedges shaded green by fill, each wedge
+labeled `fill% depth`, and the overall mean contents height (`h=`) at the
+center. The Viam app's vision test card polls this, giving a live
+visualization; detection + analysis are cached and refreshed at most every few
+seconds so the stream stays responsive. Requires `camera` in the config and a
+camera that reports intrinsics.
 
 `GetProperties` reports `object_point_clouds_supported: true`. Detections and
 classifications are not implemented and return an error.
@@ -168,7 +183,8 @@ Response:
   "floor_source": "baseline",
   "centroid_mm": { "x": 420, "y": -75 },
   "mean_height_mm": 12,
-  "sector_coverage": [0.2, 0.5, 1.0, 0.8, 0.3, 0.1, 0, 0.1],
+  "sector_fill": [0.06, 0.15, 0.6, 0.94, 0.99, 0.96, 0.61, 0.22],
+  "sector_height_mm": [8, 6, 10, 17, 19, 15, 11, 8],
   "blobs": [
     {
       "centroid_mm": { "x": 445, "y": -60 },
@@ -187,12 +203,15 @@ Response:
 | `floor_source` | `"baseline"` when a captured floor was used, `"estimated"` otherwise. |
 | `centroid_mm` | Height-weighted center of mass, pulled toward where material is piled. |
 | `mean_height_mm` | Average height above the floor. `~0` means empty or perfectly flat. |
-| `sector_coverage` | Eight wedges counterclockwise from +X, rescaled so `0` is the flattest wedge and `1` the tallest. Shows *where* material sits, not how much. |
+| `sector_fill` | Eight wedges counterclockwise from +X: the fraction of each wedge's observed area that has contents on it (cells at least 5mm above the floor). Absolute, not rescaled — an empty wedge is 0, an evenly covered one ~1.0, a half-bare one ~0.5. |
+| `sector_height_mm` | The mean contents depth per wedge, measured only where contents are present. A wedge that's half bare with a 30mm pile reads fill 0.5, height 30 — not a misleading 15mm average. |
 | `blobs` | Connected regions taller than the vessel's median height and at least 5mm above the floor (an internal noise gate). `major_axis_deg` is the elongation direction from PCA; the lengths are the region's actual footprint. |
 
-Reading the output: `sector_coverage` is rescaled per call, so an evenly
-filled vessel and an empty one both span 0..1 or read all zeros — it cannot
-tell empty from uneven on its own. Gate any consumer on `mean_height_mm`
-first ("is there anything in it?"), then use `sector_coverage` for "where is
-it?". The internal height gate keeps an empty vessel from producing noise
-blobs; regions under 10 grid cells are also dropped.
+Reading the output: fill answers "where is material and how completely does it
+cover?", height answers "how deep is it where it is", and `mean_height_mm`
+remains the overall "is there anything in it?" signal. These are honest only
+with a captured baseline (`floor_source: "baseline"`): the estimated-floor
+fallback measures from the lowest visible cell, which inflates fill on a
+tilted or unevenly-sensed vessel. The internal height gate keeps an empty
+vessel from producing noise blobs; regions under 10 grid cells are also
+dropped.

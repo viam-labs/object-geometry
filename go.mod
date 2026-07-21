@@ -6,6 +6,7 @@ require (
 	github.com/golang/geo v0.0.0-20260713102120-857a528af641
 	github.com/pkg/errors v0.9.1
 	go.viam.com/rdk v0.106.0
+	golang.org/x/image v0.25.0
 )
 
 require (
@@ -185,7 +186,6 @@ require (
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20230525183740-e7c30c78aeb2 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
-	golang.org/x/image v0.25.0 // indirect
 	golang.org/x/mod v0.30.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect

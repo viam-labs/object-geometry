@@ -1,10 +1,12 @@
 package objectgeometry
 
 import (
+	"image"
 	"math"
 	"testing"
 
 	"github.com/golang/geo/r3"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 )
 
@@ -54,17 +56,27 @@ func centroidOf(t *testing.T, result map[string]interface{}) (x, y float64) {
 	return c["x"].(float64), c["y"].(float64)
 }
 
-func sectorsOf(t *testing.T, result map[string]interface{}) [8]float64 {
+func sectorSlice(t *testing.T, result map[string]interface{}, key string) [8]float64 {
 	t.Helper()
-	raw, ok := result["sector_coverage"].([]interface{})
+	raw, ok := result[key].([]interface{})
 	if !ok {
-		t.Fatalf("no sector_coverage in result: %v", result)
+		t.Fatalf("no %s in result: %v", key, result)
 	}
 	var s [8]float64
 	for i, v := range raw {
 		s[i] = v.(float64)
 	}
 	return s
+}
+
+func fillsOf(t *testing.T, result map[string]interface{}) [8]float64 {
+	t.Helper()
+	return sectorSlice(t, result, "sector_fill")
+}
+
+func heightsOf(t *testing.T, result map[string]interface{}) [8]float64 {
+	t.Helper()
+	return sectorSlice(t, result, "sector_height_mm")
 }
 
 func blobsOf(t *testing.T, result map[string]interface{}) []map[string]interface{} {
@@ -154,29 +166,50 @@ func TestCentroidEmptyIsOrigin(t *testing.T) {
 	}
 }
 
-// A pile placed squarely in sector 0 (the +X wedge, angles 0–45°) should make
-// that sector read as the tallest, 1.0.
-func TestSectorCoverageDirection(t *testing.T) {
+// A pile placed squarely in sector 0 (the +X wedge, angles 0–45°) should give
+// that sector nonzero fill and a height near the pile's, while wedges with
+// bare floor read zero fill.
+func TestSectorFillDirection(t *testing.T) {
 	const floorZ, pileZ, rimZ = 100, 125, 140
 
 	pts := floor(-80, 80, -80, 80, 4, floorZ)
 	// Pile centered near angle 22° — the middle of sector 0.
 	pts = append(pts, floor(38, 58, 10, 30, 3, pileZ)...)
 
-	result := analyzeRegion(buildCloud(t, pts), 0, 0, rimZ, 100, 0, nil)
-	cov := sectorsOf(t, result)
+	result := analyzeRegion(buildCloud(t, pts), 0, 0, rimZ, 100, minContentsHeightMM, nil)
+	fill := fillsOf(t, result)
+	hts := heightsOf(t, result)
 
-	argmax := 0
-	for i, v := range cov {
-		if v > cov[argmax] {
-			argmax = i
+	if fill[0] <= 0 {
+		t.Errorf("sector 0 fill = %.2f, want > 0 (the pile lives there)", fill[0])
+	}
+	for i := 1; i < len(fill); i++ {
+		if fill[i] != 0 {
+			t.Errorf("sector %d fill = %.2f, want 0 (bare floor)", i, fill[i])
 		}
 	}
-	if argmax != 0 {
-		t.Errorf("tallest sector = %d (%v), want sector 0 (the +X wedge)", argmax, cov)
+	// Depth where the contents are: the pile is 25mm tall, but cells that
+	// straddle its edge mix pile and floor points, diluting the mean — so
+	// assert a clearly-substantial depth, not the exact pile height.
+	if hts[0] < 12 || hts[0] > 26 {
+		t.Errorf("sector 0 height = %.0fmm, want a substantial depth (~12-26) for a 25mm pile", hts[0])
 	}
-	if cov[0] != 1.0 {
-		t.Errorf("sector 0 coverage = %.1f, want 1.0 (the tallest normalizes to 1)", cov[0])
+}
+
+// Even contents everywhere should read as similar, near-full fills — not a
+// stretched 0..1 ranking. (An even single-layer of contents was the case that
+// made the old normalized metric misleading.)
+func TestSectorFillEvenContents(t *testing.T) {
+	const floorZ, rimZ = 100, 150
+	// A uniform 15mm layer across the whole vessel, floor visible nowhere.
+	pts := floor(-90, 90, -90, 90, 3, floorZ+15)
+	baseline := makeBaseline(t, floor(-90, 90, -90, 90, 3, floorZ), 0, 0, rimZ, 100)
+
+	fill := fillsOf(t, analyzeRegion(buildCloud(t, pts), 0, 0, rimZ, 100, minContentsHeightMM, baseline))
+	for i, f := range fill {
+		if f < 0.9 {
+			t.Errorf("sector %d fill = %.2f, want ~1.0 for an even full layer", i, f)
+		}
 	}
 }
 
@@ -300,7 +333,8 @@ func TestRimBandDerivedFromTop(t *testing.T) {
 	// Pan at an arbitrary height: rim ring at 300, floor 50mm lower at 250.
 	pts := ringFloor(120, 130, 3, 300)
 	pts = append(pts, ringFloor(0, 120, 3, 250)...)
-	zMin, zMax := s.rimBand(buildCloud(t, pts))
+	bands := s.rimBandCandidates(buildCloud(t, pts))
+	zMin, zMax := bands[0][0], bands[0][1]
 
 	if !(zMin <= 300 && 300 <= zMax) {
 		t.Errorf("rim (300) not in derived band [%.0f, %.0f]", zMin, zMax)
@@ -314,7 +348,8 @@ func TestRimBandDerivedFromTop(t *testing.T) {
 func TestRimBandPinned(t *testing.T) {
 	s := &objectGeometryShapeFit{fixedBand: true, zMinMM: 95, zMaxMM: 135}
 	pts := ringFloor(0, 100, 3, 999) // top far from the pinned band
-	zMin, zMax := s.rimBand(buildCloud(t, pts))
+	bands := s.rimBandCandidates(buildCloud(t, pts))
+	zMin, zMax := bands[0][0], bands[0][1]
 	if zMin != 95 || zMax != 135 {
 		t.Errorf("pinned band = [%.0f, %.0f], want [95, 135]", zMin, zMax)
 	}
@@ -512,7 +547,8 @@ func TestRimBandIgnoresHighOutliers(t *testing.T) {
 	pts := ringFloor(120, 130, 3, 300)                // rim ring at 300
 	pts = append(pts, floor(0, 10, 0, 10, 3, 400)...) // small outlier patch far above
 
-	zMin, zMax := s.rimBand(buildCloud(t, pts))
+	bands := s.rimBandCandidates(buildCloud(t, pts))
+	zMin, zMax := bands[0][0], bands[0][1]
 	if !(zMin <= 300 && 300 <= zMax) {
 		t.Errorf("rim (300) not in band [%.0f, %.0f]; outliers dragged it up", zMin, zMax)
 	}
@@ -524,18 +560,186 @@ func TestRimBandIgnoresHighOutliers(t *testing.T) {
 // per-cell floor cannot align, so it must fall back to the scalar floor level
 // rather than misindex.
 func TestBaselineGridMismatchFallsBack(t *testing.T) {
-	baseline := makeBaseline(t, floor(-60, 60, -60, 60, 3, 100), 0, 0, 140, 60)
+	// Baseline over a tilted floor (z = 100 + 0.05x) with a smaller radius, so
+	// its per-cell values differ measurably from the scalar floor level.
+	var pts [][3]float64
+	for x := -60.0; x <= 60; x += 3 {
+		for y := -60.0; y <= 60; y += 3 {
+			pts = append(pts, [3]float64{x, y, 100 + 0.05*x})
+		}
+	}
+	baseline := makeBaseline(t, pts, 0, 0, 140, 60)
 	other := buildHeightGrid(buildCloud(t, floor(-90, 90, -90, 90, 3, 100)), 0, 0, 140, 100)
 	if baseline.halfCells == other.halfCells {
 		t.Fatal("test setup: grids should differ in size")
 	}
 
 	floorAt := baseline.floorAt(other.halfCells)
-	// Every lookup must return the scalar floor, including out-of-range indices
-	// for the baseline's own smaller grid.
-	for _, rc := range [][2]int{{0, 0}, {other.halfCells, other.halfCells}, {2 * other.halfCells, 2 * other.halfCells}} {
-		if got := floorAt(rc[0], rc[1]); got != baseline.floorLevel {
-			t.Errorf("floorAt(%d,%d) = %.1f, want scalar fallback %.1f", rc[0], rc[1], got, baseline.floorLevel)
+
+	// A query cell inside the baseline's coverage maps by center offset: 10
+	// cells right of center = +30mm in x = floor ~101.5 on the tilt, clearly
+	// per-cell rather than the scalar level.
+	got := floorAt(other.halfCells, other.halfCells+10)
+	if math.Abs(got-101.5) > 0.5 {
+		t.Errorf("aligned in-coverage lookup = %.2f, want ~101.5 (per-cell tilted floor)", got)
+	}
+	// A query cell outside the baseline's smaller grid falls back to scalar.
+	if got := floorAt(0, 0); got != baseline.floorLevel {
+		t.Errorf("out-of-coverage lookup = %.2f, want scalar %.2f", got, baseline.floorLevel)
+	}
+}
+
+// ── overlay drawing ───────────────────────────────────────────────────────
+
+// With a trivial orthographic projector, drawVessel must put the circle on the
+// projected rim and each sector's label at the sector's mid-angle — matching
+// analyzeRegion's sector indexing (counterclockwise from +X).
+func TestDrawVesselGeometry(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	proj := func(x, y, z float64) (int, int, bool) {
+		return int(x) + 200, int(y) + 200, true
+	}
+	v := overlayVessel{centerX: 0, centerY: 0, rimZ: 100, radius: 120, analyzed: true}
+	for i := range v.fill {
+		v.fill[i] = float64(i) / 10
+		v.heightMM[i] = float64(10 + i)
+	}
+	drawVessel(img, v, proj)
+
+	// A point on the rim at angle 0 must be drawn (line color, not blank).
+	if _, _, _, a := img.RGBAAt(320, 200).RGBA(); a == 0 {
+		t.Error("rim pixel at angle 0 not drawn")
+	}
+	// Some pixel near sector 0's label position (mid-angle 22.5°, 0.65r out)
+	// must be text or shadow (non-transparent).
+	lx := 200 + int(0.65*120*math.Cos(math.Pi/8))
+	ly := 200 + int(0.65*120*math.Sin(math.Pi/8))
+	found := false
+	for dy := -10; dy <= 10 && !found; dy++ {
+		for dx := -15; dx <= 15 && !found; dx++ {
+			if _, _, _, a := img.RGBAAt(lx+dx, ly+dy).RGBA(); a != 0 {
+				found = true
+			}
 		}
+	}
+	if !found {
+		t.Errorf("no label drawn near sector 0 mid-angle at (%d, %d)", lx, ly)
+	}
+	// A projector that rejects everything must draw nothing and not panic.
+	blank := image.NewRGBA(image.Rect(0, 0, 50, 50))
+	drawVessel(blank, v, func(x, y, z float64) (int, int, bool) { return 0, 0, false })
+	for i := range blank.Pix {
+		if blank.Pix[i] != 0 {
+			t.Fatal("rejecting projector still drew pixels")
+		}
+	}
+}
+
+// An empty noisy vessel must read zero fill everywhere — the contents-height
+// gate keeps sub-noise cells from counting — while a real pile registers with
+// nonzero fill and a sensible depth.
+func TestSectorFillEmptyNoisyVessel(t *testing.T) {
+	const rimZ = 140
+	// Empty floor with bounded ±3mm per-cell noise, under the 5mm gate.
+	var pts [][3]float64
+	for x := -80.0; x <= 80; x += 3 {
+		for y := -80.0; y <= 80; y += 3 {
+			jitter := math.Mod(math.Abs(x*7+y*13), 6) - 3
+			pts = append(pts, [3]float64{x, y, 100 + jitter})
+		}
+	}
+	fill := fillsOf(t, analyzeRegion(buildCloud(t, pts), 0, 0, rimZ, 100, minContentsHeightMM, nil))
+	for i, f := range fill {
+		if f > 0.05 {
+			t.Errorf("empty noisy vessel sector %d fill = %.2f, want ~0", i, f)
+		}
+	}
+
+	// A substantial pile in sector 0 registers there and only there.
+	pts = append(pts, floor(30, 65, 5, 35, 3, 135)...)
+	fill = fillsOf(t, analyzeRegion(buildCloud(t, pts), 0, 0, rimZ, 100, minContentsHeightMM, nil))
+	if fill[0] <= 0.05 {
+		t.Errorf("piled vessel sector 0 fill = %.2f, want clearly > 0", fill[0])
+	}
+}
+
+// A tilted empty vessel with a baseline captured at the same tilt must read
+// zero fill: the tilt is in the floor map, so floor-relative heights cancel
+// it. Without a baseline the tilt's high side can exceed the contents gate —
+// the documented cost of the estimated-floor fallback.
+func TestSectorFillTiltCanceledByBaseline(t *testing.T) {
+	const rimZ = 140
+	tilted := func() [][3]float64 {
+		var pts [][3]float64
+		for x := -90.0; x <= 90; x += 3 {
+			for y := -90.0; y <= 90; y += 3 {
+				pts = append(pts, [3]float64{x, y, 100 + 0.05*x}) // ±4.5mm tilt
+			}
+		}
+		return pts
+	}
+
+	baseline := makeBaseline(t, tilted(), 0, 0, rimZ, 100)
+	fill := fillsOf(t, analyzeRegion(buildCloud(t, tilted()), 0, 0, rimZ, 100, minContentsHeightMM, baseline))
+	for i, f := range fill {
+		if f != 0 {
+			t.Errorf("tilted empty vessel with baseline: sector %d fill = %.2f, want 0", i, f)
+		}
+	}
+}
+
+// With a full vessel, contents points far outnumber rim points. The derived
+// band must still anchor on the rim — the highest substantial surface — and
+// exclude the contents, or the circle fit gets contaminated and rejected.
+// (This is the failure that blanked detection the first time food was added:
+// a mass-percentile anchor slides onto the contents.)
+func TestRimBandFullVesselExcludesContents(t *testing.T) {
+	s := &objectGeometryShapeFit{}
+
+	// Rim ring at z=104 (radius 120..128) — a few thousand points.
+	pts := ringFloor(120, 128, 2, 104)
+	rimCount := len(pts)
+	// Contents surface at z=85 filling the interior — far more points.
+	pts = append(pts, ringFloor(0, 110, 2, 85)...)
+	if contents := len(pts) - rimCount; contents < 3*rimCount {
+		t.Fatalf("test setup: contents (%d) should dwarf rim (%d)", contents, rimCount)
+	}
+
+	bands := s.rimBandCandidates(buildCloud(t, pts))
+	zMin, zMax := bands[0][0], bands[0][1]
+	if !(zMin <= 104 && 104 <= zMax) {
+		t.Errorf("rim (104) not in derived band [%.1f, %.1f]", zMin, zMax)
+	}
+	if zMin <= 85 {
+		t.Errorf("contents surface (85) inside band [%.1f, %.1f]: fit would be contaminated", zMin, zMax)
+	}
+}
+
+// A tall non-vessel object leaking into the crop (a utensil above the rim)
+// claims the highest surface. fitCloud must fall through that candidate and
+// still find the rim — this is the scene that blanked detection when a spoon
+// sat beside the pan above rim height.
+func TestFitCloudUtensilAboveRim(t *testing.T) {
+	s := &objectGeometryShapeFit{
+		logger:      logging.NewTestLogger(t),
+		shapes:      []string{"circle"},
+		minRadiusMM: 70, maxRadiusMM: 200,
+	}
+
+	// Vessel: rim ring at 104 (radius 120..128), contents surface at 80.
+	pts := ringFloor(120, 128, 2, 104)
+	pts = append(pts, ringFloor(0, 110, 3, 80)...)
+	// Utensil: a dense 40x25mm patch well above the rim, off to the side.
+	pts = append(pts, floor(150, 190, -10, 15, 2, 140)...)
+
+	r, ok := s.fitCloud(buildCloud(t, pts), 0)
+	if !ok {
+		t.Fatal("no vessel found: utensil surface should be skipped, not fatal")
+	}
+	if math.Abs(r.Radius-124) > 4 {
+		t.Errorf("radius = %.1f, want ~124 (the rim, not the utensil)", r.Radius)
+	}
+	if math.Abs(r.CenterZ-104) > 5 {
+		t.Errorf("rim height = %.1f, want ~104", r.CenterZ)
 	}
 }
