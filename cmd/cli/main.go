@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"objectgeometry"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	vision "go.viam.com/rdk/services/vision"
+	"objectgeometry"
 )
 
 func main() {
