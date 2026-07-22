@@ -3,7 +3,6 @@ package objectgeometry
 import (
 	"context"
 	"fmt"
-	"image"
 	"math"
 	"sort"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 
 	"go.viam.com/rdk/components/camera"
+	"go.viam.com/rdk/data"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
@@ -199,7 +199,7 @@ func (s *objectGeometryShapeFit) DetectionsFromCamera(ctx context.Context, camer
 	return nil, errUnimplemented
 }
 
-func (s *objectGeometryShapeFit) Detections(ctx context.Context, img image.Image, extra map[string]interface{}) ([]objdet.Detection, error) {
+func (s *objectGeometryShapeFit) Detections(ctx context.Context, img *camera.NamedImage, extra map[string]interface{}) ([]objdet.Detection, error) {
 	return nil, errUnimplemented
 }
 
@@ -207,7 +207,7 @@ func (s *objectGeometryShapeFit) ClassificationsFromCamera(ctx context.Context, 
 	return nil, errUnimplemented
 }
 
-func (s *objectGeometryShapeFit) Classifications(ctx context.Context, img image.Image, n int, extra map[string]interface{}) (classification.Classifications, error) {
+func (s *objectGeometryShapeFit) Classifications(ctx context.Context, img *camera.NamedImage, n int, extra map[string]interface{}) (classification.Classifications, error) {
 	return nil, errUnimplemented
 }
 
@@ -242,11 +242,15 @@ func (s *objectGeometryShapeFit) GetProperties(ctx context.Context, extra map[st
 func (s *objectGeometryShapeFit) CaptureAllFromCamera(ctx context.Context, cameraName string, opts viscapture.CaptureOptions, extra map[string]interface{}) (viscapture.VisCapture, error) {
 	capt := viscapture.VisCapture{}
 	if opts.ReturnImage {
-		img, err := s.annotatedFrame(ctx, extra)
+		rawImg, err := s.annotatedFrame(ctx, extra)
 		if err != nil {
 			return capt, err
 		}
-		capt.Image = img
+		namedImg, err := camera.NamedImageFromImage(rawImg, "", "", data.Annotations{})
+		if err != nil {
+			return capt, err
+		}
+		capt.Image = &namedImg
 	}
 	if opts.ReturnObject {
 		objs, err := s.GetObjectPointClouds(ctx, cameraName, extra)
