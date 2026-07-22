@@ -743,3 +743,38 @@ func TestFitCloudUtensilAboveRim(t *testing.T) {
 		t.Errorf("rim height = %.1f, want ~104", r.CenterZ)
 	}
 }
+
+// A utensil hovering AT rim height, overlapping the rim, puts its points
+// inside the rim band itself — no candidate fallthrough can dodge it. The
+// trimmed refit must eject the utensil blob and recover the rim circle.
+// (This is the scene that broke capture_baseline: spoon bowl over the rim.)
+func TestFitCloudUtensilAtRimHeight(t *testing.T) {
+	s := &objectGeometryShapeFit{
+		logger:      logging.NewTestLogger(t),
+		shapes:      []string{"circle"},
+		minRadiusMM: 70, maxRadiusMM: 200,
+	}
+
+	// Vessel: rim ring at 104, floor at 70.
+	pts := ringFloor(120, 128, 2, 104)
+	rimPts := len(pts)
+	pts = append(pts, ringFloor(0, 110, 3, 70)...)
+	// Spoon bowl: a dense 55x40mm patch at rim height, overlapping the rim's
+	// southern edge (centered ~(0, 115): half in, half out).
+	spoon := floor(-27, 27, 95, 135, 2, 104)
+	pts = append(pts, spoon...)
+	if len(spoon)*4 > rimPts*3 {
+		t.Fatalf("test setup: spoon (%d pts) should be well under half the rim ring (%d)", len(spoon), rimPts)
+	}
+
+	r, ok := s.fitCloud(buildCloud(t, pts), 0)
+	if !ok {
+		t.Fatal("no vessel found: the spoon blob should be trimmed, not fatal")
+	}
+	if math.Abs(r.Radius-124) > 5 {
+		t.Errorf("radius = %.1f, want ~124 (rim recovered despite spoon)", r.Radius)
+	}
+	if math.Hypot(r.CenterX, r.CenterY) > 6 {
+		t.Errorf("center = (%.1f, %.1f), want near origin", r.CenterX, r.CenterY)
+	}
+}

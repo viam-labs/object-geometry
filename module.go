@@ -376,11 +376,9 @@ func (s *objectGeometryShapeFit) fitCloud(pcWorld pointcloud.PointCloud, i int) 
 	}
 	for _, band := range s.rimBandCandidates(pcWorld) {
 		var pts []r3.Vector
-		var zSum float64
 		pcWorld.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
 			if p.Z >= band[0] && p.Z <= band[1] {
 				pts = append(pts, p)
-				zSum += p.Z
 			}
 			return true
 		})
@@ -393,8 +391,19 @@ func (s *objectGeometryShapeFit) fitCloud(pcWorld pointcloud.PointCloud, i int) 
 		for _, shape := range s.shapes {
 			switch shape {
 			case "circle":
-				centerX, centerY, r, rms := fitCircleKasa(pts)
-				rimZ := zSum / float64(len(pts))
+				centerX, centerY, r, rms, inliers := fitCircleTrimmed(pts)
+				if len(inliers) < minBandPoints {
+					s.logger.Debugf("object %d band [%.0f, %.0f]: only %d inliers after trim, trying next surface",
+						i, band[0], band[1], len(inliers))
+					continue
+				}
+				// Rim height from the inliers only, so an occluder that was
+				// trimmed out of the fit doesn't skew it either.
+				var inZSum float64
+				for _, p := range inliers {
+					inZSum += p.Z
+				}
+				rimZ := inZSum / float64(len(inliers))
 
 				// Points that don't lie on a circle: this surface is not a
 				// rim (a utensil, a sliver). Try the next one down.
@@ -427,7 +436,7 @@ func (s *objectGeometryShapeFit) fitCloud(pcWorld pointcloud.PointCloud, i int) 
 					CenterZ:  rimZ,
 					Radius:   r,
 					RMS:      rms,
-					PointCnt: len(pts),
+					PointCnt: len(inliers),
 					Cloud:    pcWorld,
 				}, true
 			}
@@ -1128,6 +1137,34 @@ func analyzeRegion(pc pointcloud.PointCloud, centerX, centerY, rimZ, radius, min
 // ──────────────────────────────────────────────────────────────────────────
 // Circle fit (Kasa method)
 // ──────────────────────────────────────────────────────────────────────────
+
+// fitCircleTrimmed is a robust wrapper around fitCircleKasa: fit, discard the
+// points sitting far off the fitted circle, refit on the survivors. A
+// localized occluder at rim height — a utensil hovering over the rim — gets
+// ejected as outliers instead of corrupting the fit. Trimming aborts (and the
+// plain fit stands) if it would discard more than half the points: at that
+// contamination the "outliers" may well be the real structure.
+func fitCircleTrimmed(pts []r3.Vector) (cx, cy, r, rms float64, inliers []r3.Vector) {
+	cx, cy, r, rms = fitCircleKasa(pts)
+	inliers = pts
+	for range 2 {
+		var keep []r3.Vector
+		for _, p := range inliers {
+			if math.Abs(math.Hypot(p.X-cx, p.Y-cy)-r) <= maxFitRMSMM {
+				keep = append(keep, p)
+			}
+		}
+		if len(keep) == len(inliers) {
+			break // nothing to trim; converged
+		}
+		if len(keep)*2 < len(pts) {
+			break // over half would be gone: don't trust the trim
+		}
+		inliers = keep
+		cx, cy, r, rms = fitCircleKasa(inliers)
+	}
+	return cx, cy, r, rms, inliers
+}
 
 // fitCircleKasa fits a circle to the XY projection of pts (Z is ignored) and
 // returns the center, radius, and rms residual in the same units as the input.
