@@ -116,7 +116,7 @@ func (s *objectGeometryShapeFit) sourceImage(ctx context.Context, extra map[stri
 	if imgs, _, err := s.cam.Images(ctx, nil, extra); err == nil && len(imgs) > 0 {
 		return imgs[0].Image(ctx)
 	}
-	return camera.DecodeImageFromCamera(ctx, "", extra, s.cam)
+	return camera.DecodeImageFromCamera(ctx, s.cam, nil, extra)
 }
 
 // projector builds a world-point-to-pixel function from the camera's
