@@ -21,6 +21,7 @@ import (
 	vision "go.viam.com/rdk/services/vision"
 	vis "go.viam.com/rdk/vision"
 	"go.viam.com/rdk/vision/classification"
+	"go.viam.com/rdk/vision/detection3d"
 	objdet "go.viam.com/rdk/vision/objectdetection"
 	"go.viam.com/rdk/vision/viscapture"
 )
@@ -227,6 +228,10 @@ func (s *objectGeometryShapeFit) GetObjectPointClouds(ctx context.Context, camer
 		objects = append(objects, obj)
 	}
 	return objects, nil
+}
+
+func (s *objectGeometryShapeFit) GetDetections3D(ctx context.Context, cameraName string, extra map[string]interface{}) ([]*detection3d.Detection, error) {
+	return nil, errUnimplemented
 }
 
 func (s *objectGeometryShapeFit) GetProperties(ctx context.Context, extra map[string]interface{}) (*vision.Properties, error) {
